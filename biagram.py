@@ -7,7 +7,7 @@ import torch.nn.functional as F
 batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 32 # what is the maximum context length for predictions?
 max_iters = 5000
-eval_interval = 100
+eval_interval = 1000
 learning_rate = 1e-3
 eval_iters = 200
 device = 'mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -92,6 +92,34 @@ class MultiHeadSelfAttention(nn.Module):
     def forward(self, x):
         return torch.cat([h(x) for h in self.heads], dim=-1)
 
+#-----------------Linear Layer----------------------------
+class FeedForward(nn.Module):
+    """Simple feed-forward network. followed by Relu non-linearity."""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.ReLU(),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadSelfAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+
+    def forward(self, x):
+        x = self.sa(x)
+        x = self.ffwd(x)
+        return x
+
+
+
+
+
 
 # super simple bigram model
 class BiagramLanguageModel(nn.Module):
@@ -101,7 +129,11 @@ class BiagramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding_table = nn.Embedding( block_size, n_embd) # positional embeds
-        self.sa_heads = MultiHeadSelfAttention(4, n_embd//4) # i.e 4 heads of 8-dim self attention
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size) # output layer for logits
 
 
@@ -111,9 +143,10 @@ class BiagramLanguageModel(nn.Module):
         # idx and targets are both (B,T) tensor of integers
         token_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.pos_embedding_table(torch.arange(T, device=device)) # (T, C) # adding position info to the token info
-        x = token_emb + pos_emb
-        x = self.sa_heads(x)  # apply one head of self attention (B, T, C)
-        logits = self.lm_head(token_emb) # (B, T, vocab_size) ----Decoder --------
+        x = token_emb + pos_emb #(B, T, C)
+        x = self.sa_heads(x)  # apply multiple head of self attention (B, T, C)
+        x = self.ffwd(x) # (B, T, C)
+        logits = self.lm_head(x) # (B, T, vocab_size) ----Decoder --------
 
         if targets is None:
             loss = None
