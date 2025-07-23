@@ -88,9 +88,12 @@ class MultiHeadSelfAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd, bias=False) # for skip connection projecions
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
 
 #-----------------Linear Layer----------------------------
 class FeedForward(nn.Module):
@@ -98,22 +101,27 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4*n_embd),
             nn.ReLU(),
+            nn.Linear(4*n_embd, n_embd), # projection layer back into the residual pathway
         )
     def forward(self, x):
         return self.net(x)
 
+# -----------------Transformer Block--------------------------
 class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
         self.sa = MultiHeadSelfAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd) # uses (B*T , C) means and var cal under C , rows over n_embed
+        self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = self.sa(x)
-        x = self.ffwd(x)
+        # residual connections
+        x = x + self.sa(self.ln1(x))
+        x = x +self.ffwd(self.ln2(x))
         return x
 
 
@@ -144,8 +152,7 @@ class BiagramLanguageModel(nn.Module):
         token_emb = self.token_embedding_table(idx)  # (B,T,C)
         pos_emb = self.pos_embedding_table(torch.arange(T, device=device)) # (T, C) # adding position info to the token info
         x = token_emb + pos_emb #(B, T, C)
-        x = self.sa_heads(x)  # apply multiple head of self attention (B, T, C)
-        x = self.ffwd(x) # (B, T, C)
+        x = self.blocks(x)
         logits = self.lm_head(x) # (B, T, vocab_size) ----Decoder --------
 
         if targets is None:
