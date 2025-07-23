@@ -11,6 +11,7 @@ eval_interval = 100
 learning_rate = 1e-3
 eval_iters = 200
 device = 'mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+n_embd = 32
 
 # ------------
 
@@ -59,17 +60,60 @@ def estimate_loss():
     model.train()
     return out
 
+# -----------------Self-Attention----------------------
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril((torch.ones(block_size, block_size))))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)  # (B, T, C)
+        q = self.query(x)  # (B, T, C)
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2, -1)*C**-0.5  # (B, T, C) @ (B, C, T) ---> (B, T, T )
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+
+        # perform weighted aggregation of the values
+        v = self.value(x)  # (B, T, C)
+        out = wei @ v      # (B, T, T) @ (B, T, C) -----> (B, T, C)
+        return out
+
+#------------------Multi-Head Self Attention----------------
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
+
 # super simple bigram model
 class BiagramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.pos_embedding_table = nn.Embedding( block_size, n_embd) # positional embeds
+        self.sa_heads = MultiHeadSelfAttention(4, n_embd//4) # i.e 4 heads of 8-dim self attention
+        self.lm_head = nn.Linear(n_embd, vocab_size) # output layer for logits
+
 
     def forward(self, idx, targets=None):
+        # Extracting the input shape
+        B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
-        logits = self.token_embedding_table(idx)  # (B,T,C)
+        token_emb = self.token_embedding_table(idx)  # (B,T,C)
+        pos_emb = self.pos_embedding_table(torch.arange(T, device=device)) # (T, C) # adding position info to the token info
+        x = token_emb + pos_emb
+        x = self.sa_heads(x)  # apply one head of self attention (B, T, C)
+        logits = self.lm_head(token_emb) # (B, T, vocab_size) ----Decoder --------
 
         if targets is None:
             loss = None
@@ -83,8 +127,10 @@ class BiagramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is the (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # crop the idx to the last block size token (_inorder to getrid of > blocksize as we pos emb_)
+            idx_cond = idx[:, -block_size:]
             # get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # focus only on the last time step
             logits = logits[:, -1, :]  # becomes (B ,C)
             # apply softmax to get the probs
@@ -96,7 +142,7 @@ class BiagramLanguageModel(nn.Module):
         return idx
 
 
-model = BiagramLanguageModel(vocab_size)
+model = BiagramLanguageModel()
 m = model.to(device)
 
 # print the number of parameters in the model
